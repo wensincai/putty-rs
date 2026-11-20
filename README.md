@@ -125,4 +125,4 @@ pt-gui
 
 ## 许可证
 
-MIT。本项目为 PuTTY 的独立改写，原版版权归 **Simon Tatham** 及贡献者所有，`LICENSE` 中保留原始版权声明。
+MIT，见 [`LICENSE`](LICENSE)。本项目为 PuTTY 的独立改写，不是 fork，也不包含 PuTTY 源码；原版版权归 **Simon Tatham** 及贡献者所有，其原始许可声明完整保留在 [`LICENSE-PUTTY`](LICENSE-PUTTY) 中。
