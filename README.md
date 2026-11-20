@@ -122,6 +122,7 @@ pt-gui
 | 终端不做 reflow | 改变窗口宽度时按行截断/补空，不做自动重排 |
 | 配置格式为 JSON | 不兼容 PuTTY 注册表/`~/.putty/sessions` |
 | keyboard-interactive 未实现 | 2FA/OTP 场景暂不可用 |
+| 在 mintty / Git Bash 中运行 CLI 没有 PTY | 这类终端给子进程的是管道而非控制台，`pt` 检测到 stdin 非终端后不会申请 PTY（行为同 `ssh -T`）：Tab 补全失效、vim 无法切换模式。会打印警告；可改用 Windows Terminal / cmd / PowerShell，或加 `--force-pty` |
 
 ## 许可证
 

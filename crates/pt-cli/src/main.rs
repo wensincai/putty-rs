@@ -363,6 +363,20 @@ async fn run_interactive(
     let stdin_is_tty = std::io::stdin().is_terminal();
     let want_pty = !cli.no_pty && (stdin_is_tty || cli.force_pty);
 
+    // A missing PTY is silent in OpenSSH too, but there it is never a surprise:
+    // users reach it via `ssh -T`. Here it usually means the terminal emulator
+    // gave us a pipe (mintty, some launchers), and the symptoms downstream are
+    // confusing (no Tab completion, vim cannot switch modes), so say something.
+    if !cli.no_pty && !stdin_is_tty && !cli.force_pty {
+        eprintln!(
+            "pt: warning: stdin is not a terminal, so NO PTY will be requested (like `ssh -T`)."
+        );
+        eprintln!("    Expect: no Tab completion, vi/less/htop cannot control the screen,");
+        eprintln!("    and remote lines are only echoed after Enter.");
+        eprintln!("    Fix: run pt from a real console (Windows Terminal / cmd / PowerShell),");
+        eprintln!("    or pass --force-pty to request one anyway; you can check with `tty` in the session.");
+    }
+
     let (cols, rows) = match crossterm::terminal::size() {
         Ok((c, r)) if want_pty => (c, r),
         _ => (cli.cols.unwrap_or(80), cli.rows.unwrap_or(24)),
@@ -381,8 +395,20 @@ async fn run_interactive(
     // stdin reader: raw bytes, so every key (including Ctrl-C) reaches the server
     let tx_stdin = tx.clone();
     let raw_guard = if want_pty {
-        crossterm::terminal::enable_raw_mode().ok();
-        Some(RawGuard)
+        // If raw mode fails we must say so: in cooked mode the Windows console
+        // line editor eats Tab and turns Esc into "clear the input line", which
+        // looks exactly like "those keys do nothing" while plain commands work.
+        match crossterm::terminal::enable_raw_mode() {
+            Ok(()) => Some(RawGuard),
+            Err(e) => {
+                eprintln!(
+                    "pt: warning: cannot enable raw terminal mode ({e}); \
+                     Tab/Esc/arrow keys will be handled by the local console line editor \
+                     and may never reach the remote shell."
+                );
+                None
+            }
+        }
     } else {
         None
     };
