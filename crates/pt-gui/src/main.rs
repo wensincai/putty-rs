@@ -295,15 +295,15 @@ impl App {
                         }
                     }
                 }
-                UiEvent::Closed { tab, status } => {
-                    if let Some(t) = self.tab_mut(tab) {
-                        t.status = match status {
-                            Some(c) => format!("session closed (status {c})"),
-                            None => "session closed".into(),
-                        };
-                        if let Some(s) = &mut t.session {
-                            s.connected = false;
-                        }
+                UiEvent::Closed { tab, status: _ } => {
+                    // The remote shell exited (exit/logout, or the connection
+                    // dropped after the session was up): the tab has nothing
+                    // left to show, so close it. Authentication and connection
+                    // failures arrive as Failed instead and keep the tab so
+                    // the user can read the error.
+                    self.tabs.retain(|t| t.id != tab);
+                    if self.active_tab == Some(tab) {
+                        self.active_tab = self.tabs.last().map(|t| t.id);
                     }
                 }
                 UiEvent::Failed { tab, message } => {
