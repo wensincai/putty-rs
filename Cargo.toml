@@ -1,0 +1,32 @@
+[workspace]
+members = ["crates/pt-core", "crates/pt-term", "crates/pt-cli", "crates/pt-gui"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/wensincai/putty-rs"
+rust-version = "1.85"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+russh = { version = "0.63", default-features = false, features = ["ring"] }
+russh-sftp = "3"
+clap = { version = "4", features = ["derive", "env"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+thiserror = "2"
+anyhow = "1"
+sha2 = "0.10"
+base64 = "0.22"
+vte = "0.15"
+unicode-width = "0.2"
+crossterm = "0.28"
+indicatif = "0.17"
+rpassword = "7"
+dirs = "6"
+eframe = "0.33"
+egui = "0.33"

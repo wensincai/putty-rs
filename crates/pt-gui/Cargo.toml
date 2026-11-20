@@ -1,0 +1,20 @@
+[package]
+name = "pt-gui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "pt-gui"
+path = "src/main.rs"
+
+[dependencies]
+pt-core = { path = "../pt-core" }
+pt-term = { path = "../pt-term" }
+tokio = { workspace = true }
+eframe = { workspace = true }
+egui = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
