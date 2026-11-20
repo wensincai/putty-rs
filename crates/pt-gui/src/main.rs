@@ -760,6 +760,24 @@ impl App {
             resp.request_focus();
         }
         let focused = resp.has_focus();
+        if focused {
+            // egui reserves Tab (focus navigation), Escape (drop focus) and
+            // the arrow keys (cardinal focus movement) for itself, which makes
+            // a terminal useless: Tab never completes, and pressing Esc in vim
+            // silently removes keyboard focus from the terminal widget. Lock
+            // them to this widget — it is a terminal, they are terminal keys.
+            ui.memory_mut(|m| {
+                m.set_focus_lock_filter(
+                    resp.id,
+                    egui::EventFilter {
+                        tab: true,
+                        escape: true,
+                        horizontal_arrows: true,
+                        vertical_arrows: true,
+                    },
+                );
+            });
+        }
         let app_cursor = sess.screen.modes().app_cursor_keys;
         let events = ui.input(|i| i.events.clone());
         for ev in events {
