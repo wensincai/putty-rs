@@ -668,25 +668,32 @@ impl eframe::App for App {
                         let mut select_id = None;
                         for t in &self.tabs {
                             let selected = self.active_tab == Some(t.id);
-                            // ● = shell is alive, ○ = closed/failed
-                            let dot = if t
+                            // Colour instead of a status glyph: egui's default
+                            // fonts lack most dingbats (U+2715 ✕ renders as a
+                            // tofu box), but colours are always available.
+                            let color = if t
                                 .session
                                 .as_ref()
                                 .is_some_and(|s| s.connected)
                             {
-                                "●"
+                                egui::Color32::from_rgb(140, 220, 140)
                             } else {
-                                "○"
+                                egui::Color32::from_rgb(235, 130, 120)
                             };
                             if ui
-                                .selectable_label(selected, format!("{dot} {}", t.title))
+                                .selectable_label(
+                                    selected,
+                                    egui::RichText::new(&t.title).color(color),
+                                )
                                 .clicked()
                             {
                                 select_id = Some(t.id);
                             }
+                            // × (U+00D7) is the only cross glyph present in the
+                            // bundled fonts; U+2715 ✕ is not.
                             if ui
                                 .add(
-                                    egui::Button::new(egui::RichText::new("✕").weak())
+                                    egui::Button::new(egui::RichText::new("×").weak())
                                         .frame(false)
                                         .small(),
                                 )
@@ -729,7 +736,9 @@ impl eframe::App for App {
                         if ui.selectable_label(false, label).clicked() {
                             connect_idx = Some(i);
                         }
-                        if ui.small_button("✎").clicked() {
+                        // ✎ (U+270E) is missing from the bundled fonts; ✏ (U+270F)
+                        // is covered by emoji-icon-font.
+                        if ui.small_button("✏").clicked() {
                             edit_idx = Some(i);
                         }
                         if ui.small_button("✖").clicked() {
