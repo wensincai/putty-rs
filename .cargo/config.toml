@@ -1,0 +1,4 @@
+# 静态链接 CRT（VCRUNTIME140/UCRT），使 release exe 在裸 Windows 10/11 上
+# 零依赖运行，复制单独一个 exe 即可使用。
+[build]
+rustflags = ["-C", "target-feature=+crt-static"]

@@ -6,6 +6,9 @@
 //! on network I/O.
 
 #![forbid(unsafe_code)]
+// GUI 程序不需要 Windows 自动附加的控制台窗口；release 构建改用 windows 子系统
+// 隐藏它。debug 构建保留控制台，便于直接看到 panic 输出。
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod creds;
 
