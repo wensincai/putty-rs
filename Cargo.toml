@@ -10,7 +10,7 @@ repository = "https://github.com/wensincai/putty-rs"
 rust-version = "1.85"
 
 [workspace.dependencies]
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "fs", "io-util", "sync", "signal"] }
 russh = { version = "0.63", default-features = false, features = ["ring"] }
 russh-sftp = "3"
 clap = { version = "4", features = ["derive", "env"] }
@@ -30,3 +30,11 @@ rpassword = "7"
 dirs = "6"
 eframe = "0.33"
 egui = "0.33"
+
+# 体积优化：不影响功能，仅在 release 生效
+[profile.release]
+strip = true          # 去除符号表与调试信息
+lto = "fat"           # 跨 crate 全量优化，剔除死代码
+codegen-units = 1     # 单编译单元，配合 lto 剔除更彻底
+panic = "abort"       # 放弃 unwind 表（代码中未使用 catch_unwind）
+opt-level = "z"       # 按体积优化
