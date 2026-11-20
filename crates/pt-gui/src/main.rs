@@ -341,76 +341,159 @@ fn cell_colors(cell: &Cell) -> (egui::Color32, egui::Color32) {
     (fg, bg)
 }
 
+/// Text as the remote shell expects: LF becomes CR (Enter sends CR), and when
+/// the application enabled bracketed paste mode, wrap it so vim/readline treat
+/// it as one blob instead of executing embedded newlines.
+fn paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
+    let text = text.replace("\r\n", "\n").replace('\r', "\n").replace('\n', "\r");
+    if bracketed {
+        let mut b = b"\x1b[200~".to_vec();
+        b.extend_from_slice(text.as_bytes());
+        b.extend_from_slice(b"\x1b[201~");
+        b
+    } else {
+        text.into_bytes()
+    }
+}
+
+/// Read the OS clipboard; a fresh handle per call keeps it simple and safe.
+fn clipboard_text() -> Option<String> {
+    arboard::Clipboard::new().ok()?.get_text().ok().filter(|s| !s.is_empty())
+}
+
+/// Copy the current selection (if any) to the clipboard.
+fn copy_selection(sess: &Session, ui: &egui::Ui) {
+    let Some(((x0, y0), (x1, y1))) = sess.selection else {
+        return;
+    };
+    let (ax, ay, bx, by) = if (y0, x0) <= (y1, x1) {
+        (x0, y0, x1, y1)
+    } else {
+        (x1, y1, x0, y0)
+    };
+    let mut text = String::new();
+    for y in ay..=by {
+        let line = sess.screen.line(y);
+        let s: String = line
+            .iter()
+            .skip(ax)
+            .take(bx.saturating_sub(ax) + 1)
+            .filter(|c| c.width != 0)
+            .map(|c| c.ch)
+            .collect();
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str(s.trim_end());
+    }
+    ui.ctx().copy_text(text);
+}
+
 /// Map an egui key press to the byte sequence a terminal expects.
 fn key_bytes(key: egui::Key, mods: egui::Modifiers, app_cursor: bool) -> Option<Vec<u8>> {
     use egui::Key::*;
-    if mods.ctrl {
-        // Control characters: Ctrl-A..Ctrl-Z → 0x01..0x1a
-        let c = match key {
-            A => 0x01,
-            B => 0x02,
-            C => 0x03,
-            D => 0x04,
-            E => 0x05,
-            F => 0x06,
-            G => 0x07,
-            H => 0x08,
-            I => 0x09,
-            J => 0x0a,
-            K => 0x0b,
-            L => 0x0c,
-            M => 0x0d,
-            N => 0x0e,
-            O => 0x0f,
-            P => 0x10,
-            Q => 0x11,
-            R => 0x12,
-            S => 0x13,
-            T => 0x14,
-            U => 0x15,
-            V => 0x16,
-            W => 0x17,
-            X => 0x18,
-            Y => 0x19,
-            Z => 0x1a,
-            Space => 0x00,
-            _ => return None,
+
+    // ---- Ctrl combos → C0 controls --------------------------------------
+    // Ctrl-A..Z are 0x01..0x1a; the classic aliases too:
+    // Ctrl+[ = Esc, Ctrl+] = GS, Ctrl+\ = FS, Ctrl+2..8 (readline/vim habits).
+    // AltGr shows up as ctrl+alt on Windows, so exclude alt from this arm.
+    if mods.ctrl && !mods.alt {
+        // Arrows with Ctrl fall through to the xterm modifier encoding.
+        let c: Option<u8> = match key {
+            A => Some(0x01),
+            B => Some(0x02),
+            C => Some(0x03),
+            D => Some(0x04),
+            E => Some(0x05),
+            F => Some(0x06),
+            G => Some(0x07),
+            H => Some(0x08),
+            I => Some(0x09),
+            J => Some(0x0a),
+            K => Some(0x0b),
+            L => Some(0x0c),
+            M => Some(0x0d),
+            N => Some(0x0e),
+            O => Some(0x0f),
+            P => Some(0x10),
+            Q => Some(0x11),
+            R => Some(0x12),
+            S => Some(0x13),
+            T => Some(0x14),
+            U => Some(0x15),
+            V => Some(0x16),
+            W => Some(0x17),
+            X => Some(0x18),
+            Y => Some(0x19),
+            Z => Some(0x1a),
+            Space => Some(0x00),
+            Num2 => Some(0x00),
+            Num3 => Some(0x1b),
+            Num4 => Some(0x1c),
+            Num5 => Some(0x1d),
+            Num6 => Some(0x1e),
+            Num7 => Some(0x1f),
+            Num8 => Some(0x7f),
+            OpenBracket => Some(0x1b),
+            CloseBracket => Some(0x1d),
+            Backslash => Some(0x1c),
+            // Arrows with Ctrl fall through to the xterm modifier encoding.
+            _ => None,
         };
-        return Some(vec![c]);
+        if let Some(c) = c {
+            return Some(vec![c]);
+        }
     }
+
+    // ---- Tab / Shift+Tab -------------------------------------------------
+    // Shift+Tab is backtab (CSI Z): menu completion in bash, visual mode jump.
+    if key == Tab {
+        return Some(if mods.shift {
+            b"\x1b[Z".to_vec()
+        } else {
+            b"\t".to_vec()
+        });
+    }
+
+    // ---- Arrows, with xterm modifier parameters --------------------------
+    // Ctrl+Left/Right = word jump in readline ("1;5"); Alt+arrows likewise
+    // ("1;3"). Plain arrows follow application cursor keypad mode.
+    let dir: Option<char> = match key {
+        ArrowUp => Some('A'),
+        ArrowDown => Some('B'),
+        ArrowRight => Some('C'),
+        ArrowLeft => Some('D'),
+        _ => None,
+    };
+    if let Some(c) = dir {
+        if mods.alt || mods.ctrl {
+            let param = match (mods.ctrl, mods.alt) {
+                (true, true) => "1;7",
+                (true, false) => "1;5",
+                (false, true) => "1;3",
+                (false, false) => unreachable!(),
+            };
+            return Some(format!("\x1b[{param}{c}").into_bytes());
+        }
+        return Some(if app_cursor {
+            format!("\x1bO{c}").into_bytes()
+        } else {
+            format!("\x1b[{c}").into_bytes()
+        });
+    }
+
+    // ---- Alt+Backspace → ESC DEL (kill word backwards in readline) -------
+    if key == Backspace {
+        return Some(if mods.alt {
+            b"\x1b\x7f".to_vec()
+        } else {
+            vec![0x7f]
+        });
+    }
+
     let seq: Vec<u8> = match key {
         Enter => b"\r".to_vec(),
-        Backspace => vec![0x7f],
-        Tab => b"\t".to_vec(),
         Escape => vec![0x1b],
-        ArrowUp => {
-            if app_cursor {
-                b"\x1bOA".to_vec()
-            } else {
-                b"\x1b[A".to_vec()
-            }
-        }
-        ArrowDown => {
-            if app_cursor {
-                b"\x1bOB".to_vec()
-            } else {
-                b"\x1b[B".to_vec()
-            }
-        }
-        ArrowRight => {
-            if app_cursor {
-                b"\x1bOC".to_vec()
-            } else {
-                b"\x1b[C".to_vec()
-            }
-        }
-        ArrowLeft => {
-            if app_cursor {
-                b"\x1bOD".to_vec()
-            } else {
-                b"\x1b[D".to_vec()
-            }
-        }
         Home => b"\x1b[H".to_vec(),
         End => b"\x1b[F".to_vec(),
         PageUp => b"\x1b[5~".to_vec(),
@@ -779,10 +862,25 @@ impl App {
             });
         }
         let app_cursor = sess.screen.modes().app_cursor_keys;
+        let bracketed_paste = sess.screen.modes().bracketed_paste;
+        let cur_mods = ui.input(|i| i.modifiers);
         let events = ui.input(|i| i.events.clone());
         for ev in events {
             match ev {
                 egui::Event::Text(t) if focused => {
+                    // Alt+char is the Meta prefix (Alt-b/Alt-f word jump in
+                    // readline). AltGr reports ctrl+alt, so exclude it.
+                    let bytes = if cur_mods.alt && !cur_mods.ctrl {
+                        let mut b = vec![0x1b];
+                        b.extend_from_slice(&t.into_bytes());
+                        b
+                    } else {
+                        t.into_bytes()
+                    };
+                    let _ = sess.input.send(InputMsg::Data(bytes));
+                }
+                // IME commits (Chinese/Japanese/…) arrive here, not as Text.
+                egui::Event::Ime(egui::ImeEvent::Commit(t)) if focused => {
                     let _ = sess.input.send(InputMsg::Data(t.into_bytes()));
                 }
                 egui::Event::Key {
@@ -793,38 +891,49 @@ impl App {
                 } if focused => {
                     if modifiers.ctrl && modifiers.shift {
                         if key == egui::Key::C {
-                            if let Some(((x0, y0), (x1, y1))) = sess.selection {
-                                let (ax, ay, bx, by) = if (y0, x0) <= (y1, x1) {
-                                    (x0, y0, x1, y1)
-                                } else {
-                                    (x1, y1, x0, y0)
-                                };
-                                let mut text = String::new();
-                                for y in ay..=by {
-                                    let line = sess.screen.line(y);
-                                    let s: String = line
-                                        .iter()
-                                        .skip(ax)
-                                        .take(bx.saturating_sub(ax) + 1)
-                                        .filter(|c| c.width != 0)
-                                        .map(|c| c.ch)
-                                        .collect();
-                                    if !text.is_empty() {
-                                        text.push('\n');
-                                    }
-                                    text.push_str(s.trim_end());
-                                }
-                                ui.ctx().copy_text(text);
-                            }
+                            copy_selection(sess, ui);
                         }
                         continue;
+                    }
+                    // Ctrl+V: egui only synthesizes Paste for Shift+Insert on
+                    // Windows, so intercept Ctrl+V and paste ourselves.
+                    if modifiers.ctrl && !modifiers.shift && key == egui::Key::V {
+                        if let Some(text) = clipboard_text() {
+                            let _ = sess
+                                .input
+                                .send(InputMsg::Data(paste_bytes(&text, bracketed_paste)));
+                        }
+                        continue;
+                    }
+                    // Shift+PageUp/PageDown: local scrollback, like PuTTY.
+                    if modifiers.shift && !modifiers.ctrl {
+                        match key {
+                            egui::Key::PageUp => {
+                                let max = sess.screen.scrollback_len() as i64;
+                                sess.scroll =
+                                    (sess.scroll as i64 + sess.screen.size().1 as i64).clamp(0, max)
+                                        as usize;
+                                continue;
+                            }
+                            egui::Key::PageDown => {
+                                sess.scroll = sess
+                                    .scroll
+                                    .saturating_sub(sess.screen.size().1);
+                                continue;
+                            }
+                            _ => {}
+                        }
                     }
                     if let Some(bytes) = key_bytes(key, modifiers, app_cursor) {
                         let _ = sess.input.send(InputMsg::Data(bytes));
                     }
                 }
-                egui::Event::Paste(s) => {
-                    let _ = sess.input.send(InputMsg::Data(s.into_bytes()));
+                // Windows: Ctrl+Insert. Paste comes through on Shift+Insert.
+                egui::Event::Copy if focused => copy_selection(sess, ui),
+                egui::Event::Paste(s) if focused => {
+                    let _ = sess
+                        .input
+                        .send(InputMsg::Data(paste_bytes(&s, bracketed_paste)));
                 }
                 _ => {}
             }
@@ -866,24 +975,64 @@ impl App {
 mod tests {
     use super::*;
 
-    fn kb(k: egui::Key, ctrl: bool, shift: bool) -> Option<Vec<u8>> {
-        let mods = egui::Modifiers { ctrl, shift, ..Default::default() };
-        key_bytes(k, mods, false)
+    fn kb(k: egui::Key, mods: egui::Modifiers, app_cursor: bool) -> Option<Vec<u8>> {
+        key_bytes(k, mods, app_cursor)
     }
 
     #[test]
     fn control_keys_map_to_c0() {
-        assert_eq!(kb(egui::Key::C, true, false).unwrap(), vec![0x03]); // Ctrl-C
-        assert_eq!(kb(egui::Key::D, true, false).unwrap(), vec![0x04]); // Ctrl-D
-        assert_eq!(kb(egui::Key::Space, true, false).unwrap(), vec![0x00]);
+        assert_eq!(kb(egui::Key::C, mods_ctrl(), false).unwrap(), vec![0x03]); // Ctrl-C
+        assert_eq!(kb(egui::Key::D, mods_ctrl(), false).unwrap(), vec![0x04]); // Ctrl-D
+        assert_eq!(kb(egui::Key::Space, mods_ctrl(), false).unwrap(), vec![0x00]);
     }
 
     #[test]
     fn navigation_sequences() {
-        assert_eq!(kb(egui::Key::ArrowUp, false, false).unwrap(), b"\x1b[A".to_vec());
-        assert_eq!(kb(egui::Key::Delete, false, false).unwrap(), b"\x1b[3~".to_vec());
-        assert_eq!(kb(egui::Key::Enter, false, false).unwrap(), b"\r".to_vec());
-        assert_eq!(kb(egui::Key::Backspace, false, false).unwrap(), vec![0x7f]);
+        let mods = egui::Modifiers::default();
+        assert_eq!(kb(egui::Key::ArrowUp, mods, false).unwrap(), b"\x1b[A".to_vec());
+        assert_eq!(kb(egui::Key::Delete, mods, false).unwrap(), b"\x1b[3~".to_vec());
+        assert_eq!(kb(egui::Key::Enter, mods, false).unwrap(), b"\r".to_vec());
+        assert_eq!(kb(egui::Key::Backspace, mods, false).unwrap(), vec![0x7f]);
+        assert_eq!(kb(egui::Key::Escape, mods, false).unwrap(), vec![0x1b]);
+    }
+
+    #[test]
+    fn modified_keys() {
+        let mods = egui::Modifiers::default();
+        // Shift+Tab is backtab, not tab.
+        let shift = egui::Modifiers { shift: true, ..Default::default() };
+        assert_eq!(kb(egui::Key::Tab, shift, false).unwrap(), b"\x1b[Z".to_vec());
+        assert_eq!(kb(egui::Key::Tab, mods, false).unwrap(), b"\t".to_vec());
+        // Ctrl+[ is ESC; Ctrl+] is GS; Ctrl+\ is FS.
+        assert_eq!(kb(egui::Key::OpenBracket, mods_ctrl(), false).unwrap(), vec![0x1b]);
+        assert_eq!(kb(egui::Key::CloseBracket, mods_ctrl(), false).unwrap(), vec![0x1d]);
+        assert_eq!(kb(egui::Key::Backslash, mods_ctrl(), false).unwrap(), vec![0x1c]);
+        // Modified arrows: Ctrl+Right = word jump, Alt+Up likewise.
+        assert_eq!(
+            kb(egui::Key::ArrowRight, mods_ctrl(), false).unwrap(),
+            b"\x1b[1;5C".to_vec()
+        );
+        let alt = egui::Modifiers { alt: true, ..Default::default() };
+        assert_eq!(
+            kb(egui::Key::ArrowUp, alt, false).unwrap(),
+            b"\x1b[1;3A".to_vec()
+        );
+        // Alt+Backspace = ESC DEL (kill word).
+        assert_eq!(kb(egui::Key::Backspace, alt, false).unwrap(), b"\x1b\x7f".to_vec());
+    }
+
+    #[test]
+    fn paste_wraps_in_bracketed_mode() {
+        assert_eq!(paste_bytes("a\nb", false), b"a\rb".to_vec());
+        assert_eq!(
+            paste_bytes("a\nb", true),
+            b"\x1b[200~a\rb\x1b[201~".to_vec()
+        );
+        assert_eq!(paste_bytes("x\r\ny", false), b"x\ry".to_vec());
+    }
+
+    fn mods_ctrl() -> egui::Modifiers {
+        egui::Modifiers { ctrl: true, ..Default::default() }
     }
 
     #[test]

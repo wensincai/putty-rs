@@ -3535,6 +3535,7 @@ dependencies = [
 name = "pt-gui"
 version = "0.1.0"
 dependencies = [
+ "arboard",
  "eframe",
  "egui",
  "pt-core",
