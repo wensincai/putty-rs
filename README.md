@@ -96,11 +96,11 @@ pt-gui
 
 认证顺序默认 `publickey,agent,password,keyboard-interactive`（keyboard-interactive 的密码型提示同样走密码回调），可用 `-o PreferredAuthentications=password` 调整；密码优先取 `$PT_PASSWORD`，否则交互提示（不回显）。
 
-配置与会话保存在 `%APPDATA%\pt-rs\sessions.json`（Windows）或 `~/.config/pt-rs/sessions.json`。密码不写入磁盘。
+配置与会话保存在 `%APPDATA%\pt-rs\sessions.json`（Windows）或 `~/.config/pt-rs/sessions.json`。GUI 的密码**不写入 sessions.json**（该文件为明文 JSON），而是按需存入 **Windows 凭据管理器**（DPAPI 加密、绑定当前用户）：会话表单里输入密码后 "Save & connect"、或在连接时密码框勾选 "Remember password" 即记忆，之后点 ▶ 直接免密连接；若服务端拒绝已记忆的密码会自动清除并重新询问。删除会话时同步删除其凭据。CLI 的密码仍只在内存/环境变量。
 
 ## 验证
 
-- `cargo test --workspace`：**39 项全绿**（known_hosts 匹配矩阵与通配符/否定、指纹向量、Digest… 端口转发解析、终端网格/SGR/备用屏/宽字符/滚动区、GUI 键位映射）
+- `cargo test --workspace`：**40 项全绿**（known_hosts 匹配矩阵与通配符/否定、指纹向量、Digest… 端口转发解析、终端网格/SGR/备用屏/宽字符/滚动区、GUI 键位映射、凭据存取往返）
 - `cargo clippy --workspace --all-targets`：**0 警告**
 - 真实环境端到端：
   - GitHub（`git@github.com`）：公钥认证成功，`--host-key-policy strict` 正确拒绝未知主机，篡改 known_hosts 后报 `HOST KEY CHANGED` 并给出新旧指纹

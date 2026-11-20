@@ -7,6 +7,8 @@
 
 #![forbid(unsafe_code)]
 
+mod creds;
+
 use eframe::egui;
 use pt_core::config::{Config, SessionProfile};
 use pt_core::shell::{run_shell, InputMsg, ShellChunk, ShellOptions};
@@ -43,6 +45,9 @@ struct Session {
     selection: Option<((usize, usize), (usize, usize))>,
     drag_anchor: Option<(usize, usize)>,
     fingerprint: String,
+    /// Target whose password came from the OS credential store, so a rejected
+    /// secret can be dropped and the user asked for a fresh one.
+    stored_pw_target: Option<String>,
 }
 
 struct Form {
@@ -89,12 +94,17 @@ struct App {
     theme_dark: bool,
     /// A saved session waiting for its password before connecting.
     pw_dialog: Option<PwDialog>,
+    /// Target of the session whose password was read from the credential
+    /// store for the current connection attempt.
+    stored_pw_target: Option<String>,
 }
 
-/// Password asked at connect time; never persisted to sessions.json.
+/// Password asked at connect time; only persisted to the OS credential store
+/// when the user ticks "Remember password".
 struct PwDialog {
     profile: SessionProfile,
     text: String,
+    remember: bool,
 }
 
 impl App {
@@ -120,27 +130,44 @@ impl App {
             status: String::new(),
             theme_dark: true,
             pw_dialog: None,
+            stored_pw_target: None,
         }
     }
 
-    /// Connect straight away when a key is configured; otherwise ask for a
-    /// password first (the GUI cannot prompt mid-authentication like the CLI).
+    /// Connect straight away when a key is configured or a remembered password
+    /// exists in the OS credential store; otherwise ask for one.
     fn start_connect(&mut self, profile: SessionProfile, ctx: egui::Context) {
         if profile.auth.key_path.is_some() {
             self.connect(profile, None, ctx);
+        } else if let Some(pw) = creds::get(&profile.target()) {
+            self.connect_stored(profile, pw, ctx);
         } else {
-            self.pw_dialog = Some(PwDialog { profile, text: String::new() });
+            self.pw_dialog = Some(PwDialog {
+                profile,
+                text: String::new(),
+                remember: true,
+            });
         }
     }
 
     /// Like [`App::start_connect`], but with a password typed into the session
-    /// form (used by "Save & connect"); empty means ask in the dialog.
+    /// form (used by "Save & connect"); empty means ask in the dialog. A typed
+    /// password is remembered in the credential store — that is what users
+    /// expect "Save & connect" to do.
     fn start_connect_with(&mut self, profile: SessionProfile, pw: String, ctx: egui::Context) {
         if pw.is_empty() {
             self.start_connect(profile, ctx);
         } else {
+            if let Err(e) = creds::set(&profile.target(), &pw) {
+                self.status = format!("cannot remember password: {e}");
+            }
             self.connect(profile, Some(pw), ctx);
         }
+    }
+
+    fn connect_stored(&mut self, profile: SessionProfile, pw: String, ctx: egui::Context) {
+        self.stored_pw_target = Some(profile.target());
+        self.connect(profile, Some(pw), ctx);
     }
 
     fn connect(&mut self, profile: SessionProfile, password: Option<String>, ctx: egui::Context) {
@@ -156,6 +183,7 @@ impl App {
             selection: None,
             drag_anchor: None,
             fingerprint: String::new(),
+            stored_pw_target: self.stored_pw_target.take(),
         });
         self.status = format!("connecting to {}…", profile.target());
 
@@ -230,10 +258,22 @@ impl App {
                     }
                 }
                 UiEvent::Failed(msg) => {
-                    self.status = format!("error: {msg}");
                     if let Some(s) = &mut self.session {
                         s.connected = false;
-                        s.error = Some(msg);
+                        s.error = Some(msg.clone());
+                        // A remembered password that the server rejected is
+                        // now stale: drop it so the next ▶ asks for a fresh
+                        // one instead of silently failing forever.
+                        if let Some(t) = s.stored_pw_target.take() {
+                            creds::delete(&t);
+                            self.status = format!(
+                                "error: {msg} — the remembered password was rejected and cleared; click ▶ to re-enter"
+                            );
+                        } else {
+                            self.status = format!("error: {msg}");
+                        }
+                    } else {
+                        self.status = format!("error: {msg}");
                     }
                 }
             }
@@ -607,6 +647,8 @@ impl eframe::App for App {
                     self.show_form = true;
                 }
                 if let Some(i) = delete_idx {
+                    let t = self.cfg.sessions[i].target();
+                    creds::delete(&t);
                     self.cfg.sessions.remove(i);
                     let _ = self.cfg.save();
                 }
@@ -692,8 +734,9 @@ impl eframe::App for App {
             self.show_form = open;
         }
 
-        // Connect-time password dialog for saved sessions. The password stays
-        // in memory only — PuTTY does not persist it either.
+        // Connect-time password dialog for saved sessions without a
+        // remembered password. The password is only written to the OS
+        // credential store (never to sessions.json) when "Remember" is ticked.
         if self.pw_dialog.is_some() {
             let mut open = true;
             let mut submit = false;
@@ -712,6 +755,7 @@ impl eframe::App for App {
                         {
                             submit = true;
                         }
+                        ui.checkbox(&mut d.remember, "Remember password (Windows Credential Manager, encrypted)");
                         ui.separator();
                         ui.horizontal(|ui| {
                             if ui.button("Connect").clicked() {
@@ -729,6 +773,16 @@ impl eframe::App for App {
             match self.pw_dialog.take() {
                 Some(d) if submit => {
                     let pw = if d.text.is_empty() { None } else { Some(d.text) };
+                    if let Some(p) = &pw {
+                        if d.remember {
+                            match creds::set(&d.profile.target(), p) {
+                                Ok(()) => self.stored_pw_target = None,
+                                Err(e) => {
+                                    self.status = format!("cannot remember password: {e}");
+                                }
+                            }
+                        }
+                    }
                     self.connect(d.profile, pw, ctx.clone());
                 }
                 Some(d) if open => self.pw_dialog = Some(d),

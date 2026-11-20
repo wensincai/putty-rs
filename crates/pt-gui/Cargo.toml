@@ -12,6 +12,7 @@ path = "src/main.rs"
 pt-core = { path = "../pt-core" }
 pt-term = { path = "../pt-term" }
 arboard = "3"
+keyring = { version = "3", default-features = false, features = ["windows-native"] }
 tokio = { workspace = true }
 eframe = { workspace = true }
 egui = { workspace = true }
