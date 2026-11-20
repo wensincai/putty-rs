@@ -28,12 +28,12 @@ fn main() -> eframe::Result<()> {
     eframe::run_native("pt-gui", options, Box::new(|cc| Ok(Box::new(App::new(cc)))))
 }
 
-/// Events from the SSH task to the UI thread.
+/// Events from an SSH task to the UI thread, tagged with the owning tab.
 enum UiEvent {
-    Output(Vec<u8>),
-    Connected(String),
-    Closed(Option<u32>),
-    Failed(String),
+    Output { tab: u64, data: Vec<u8> },
+    Connected { tab: u64, fingerprint: String },
+    Closed { tab: u64, status: Option<u32> },
+    Failed { tab: u64, message: String },
 }
 
 struct Session {
@@ -48,6 +48,16 @@ struct Session {
     /// Target whose password came from the OS credential store, so a rejected
     /// secret can be dropped and the user asked for a fresh one.
     stored_pw_target: Option<String>,
+}
+
+/// One terminal tab: a live (or failing) SSH session and its UI state.
+/// The counterpart of one PuTTY window.
+struct Tab {
+    id: u64,
+    /// Shown on the tab strip; `user@host[:port]` captured at connect time.
+    title: String,
+    status: String,
+    session: Option<Session>,
 }
 
 struct Form {
@@ -84,12 +94,17 @@ impl Default for Form {
 
 struct App {
     cfg: Config,
-    session: Option<Session>,
+    /// Open terminal tabs; several sessions can run at the same time.
+    tabs: Vec<Tab>,
+    /// Currently shown tab, if any.
+    active_tab: Option<u64>,
+    next_tab_id: u64,
     rt: tokio::runtime::Runtime,
     evt_tx: Sender<UiEvent>,
     evt_rx: Receiver<UiEvent>,
     form: Form,
     show_form: bool,
+    /// Global notices (config save failures, …) not tied to a tab.
     status: String,
     theme_dark: bool,
     /// A saved session waiting for its password before connecting.
@@ -121,7 +136,9 @@ impl App {
         let (evt_tx, evt_rx) = channel();
         App {
             cfg,
-            session: None,
+            tabs: Vec::new(),
+            active_tab: None,
+            next_tab_id: 1,
             rt,
             evt_tx,
             evt_rx,
@@ -131,6 +148,24 @@ impl App {
             theme_dark: true,
             pw_dialog: None,
             stored_pw_target: None,
+        }
+    }
+
+    fn tab_mut(&mut self, id: u64) -> Option<&mut Tab> {
+        self.tabs.iter_mut().find(|t| t.id == id)
+    }
+
+    /// Close a tab: tell the shell we are leaving (Eof), drop it, and focus
+    /// the nearest remaining tab.
+    fn close_tab(&mut self, id: u64) {
+        if let Some(t) = self.tabs.iter().find(|t| t.id == id) {
+            if let Some(s) = &t.session {
+                let _ = s.input.send(InputMsg::Eof);
+            }
+        }
+        self.tabs.retain(|t| t.id != id);
+        if self.active_tab == Some(id) {
+            self.active_tab = self.tabs.last().map(|t| t.id);
         }
     }
 
@@ -174,18 +209,25 @@ impl App {
         let cols = profile.terminal.cols;
         let rows = profile.terminal.rows;
         let (itx, irx) = unbounded_channel::<InputMsg>();
-        self.session = Some(Session {
-            screen: Screen::new(cols, rows, profile.terminal.scrollback),
-            input: itx,
-            connected: false,
-            error: None,
-            scroll: 0,
-            selection: None,
-            drag_anchor: None,
-            fingerprint: String::new(),
-            stored_pw_target: self.stored_pw_target.take(),
+        let id = self.next_tab_id;
+        self.next_tab_id += 1;
+        self.tabs.push(Tab {
+            id,
+            title: profile.target(),
+            status: format!("connecting to {}…", profile.target()),
+            session: Some(Session {
+                screen: Screen::new(cols, rows, profile.terminal.scrollback),
+                input: itx,
+                connected: false,
+                error: None,
+                scroll: 0,
+                selection: None,
+                drag_anchor: None,
+                fingerprint: String::new(),
+                stored_pw_target: self.stored_pw_target.take(),
+            }),
         });
-        self.status = format!("connecting to {}…", profile.target());
+        self.active_tab = Some(id);
 
         let evt = self.evt_tx.clone();
         let ctx2 = ctx.clone();
@@ -195,9 +237,10 @@ impl App {
             opts.password = password;
             let result = async {
                 let connected = pt_core::connect(opts).await?;
-                let _ = evt.send(UiEvent::Connected(
-                    connected.host_key.fingerprint.clone(),
-                ));
+                let _ = evt.send(UiEvent::Connected {
+                    tab: id,
+                    fingerprint: connected.host_key.fingerprint.clone(),
+                });
                 ctx2.request_repaint();
                 let handle = std::sync::Arc::new(connected.handle);
                 let shell_opts = ShellOptions {
@@ -212,7 +255,7 @@ impl App {
                     let bytes = match chunk {
                         ShellChunk::Stdout(d) | ShellChunk::Stderr(d) => d,
                     };
-                    let _ = evt_out.send(UiEvent::Output(bytes));
+                    let _ = evt_out.send(UiEvent::Output { tab: id, data: bytes });
                     ctx_out.request_repaint();
                 })
                 .await
@@ -220,10 +263,10 @@ impl App {
             .await;
             match result {
                 Ok(status) => {
-                    let _ = evt.send(UiEvent::Closed(status));
+                    let _ = evt.send(UiEvent::Closed { tab: id, status });
                 }
                 Err(e) => {
-                    let _ = evt.send(UiEvent::Failed(e.to_string()));
+                    let _ = evt.send(UiEvent::Failed { tab: id, message: e.to_string() });
                 }
             }
             ctx2.request_repaint();
@@ -233,47 +276,56 @@ impl App {
     fn drain_events(&mut self) {
         while let Ok(ev) = self.evt_rx.try_recv() {
             match ev {
-                UiEvent::Output(bytes) => {
-                    if let Some(s) = &mut self.session {
-                        s.screen.feed(&bytes);
-                        for r in s.screen.take_responses() {
-                            let _ = s.input.send(InputMsg::Data(r));
+                UiEvent::Output { tab, data } => {
+                    if let Some(t) = self.tab_mut(tab) {
+                        if let Some(s) = &mut t.session {
+                            s.screen.feed(&data);
+                            for r in s.screen.take_responses() {
+                                let _ = s.input.send(InputMsg::Data(r));
+                            }
                         }
                     }
                 }
-                UiEvent::Connected(fp) => {
-                    if let Some(s) = &mut self.session {
-                        s.connected = true;
-                        s.fingerprint = fp.clone();
+                UiEvent::Connected { tab, fingerprint } => {
+                    if let Some(t) = self.tab_mut(tab) {
+                        t.status = format!("connected ({fingerprint})");
+                        if let Some(s) = &mut t.session {
+                            s.connected = true;
+                            s.fingerprint = fingerprint;
+                        }
                     }
-                    self.status = format!("connected ({fp})");
                 }
-                UiEvent::Closed(status) => {
-                    self.status = match status {
-                        Some(c) => format!("session closed (status {c})"),
-                        None => "session closed".into(),
+                UiEvent::Closed { tab, status } => {
+                    if let Some(t) = self.tab_mut(tab) {
+                        t.status = match status {
+                            Some(c) => format!("session closed (status {c})"),
+                            None => "session closed".into(),
+                        };
+                        if let Some(s) = &mut t.session {
+                            s.connected = false;
+                        }
+                    }
+                }
+                UiEvent::Failed { tab, message } => {
+                    let Some(t) = self.tab_mut(tab) else {
+                        continue; // tab already closed by the user
                     };
-                    if let Some(s) = &mut self.session {
+                    if let Some(s) = &mut t.session {
                         s.connected = false;
-                    }
-                }
-                UiEvent::Failed(msg) => {
-                    if let Some(s) = &mut self.session {
-                        s.connected = false;
-                        s.error = Some(msg.clone());
+                        s.error = Some(message.clone());
                         // A remembered password that the server rejected is
                         // now stale: drop it so the next ▶ asks for a fresh
                         // one instead of silently failing forever.
-                        if let Some(t) = s.stored_pw_target.take() {
-                            creds::delete(&t);
-                            self.status = format!(
-                                "error: {msg} — the remembered password was rejected and cleared; click ▶ to re-enter"
+                        if let Some(target) = s.stored_pw_target.take() {
+                            creds::delete(&target);
+                            t.status = format!(
+                                "error: {message} — the remembered password was rejected and cleared; click ▶ to re-enter"
                             );
                         } else {
-                            self.status = format!("error: {msg}");
+                            t.status = format!("error: {message}");
                         }
                     } else {
-                        self.status = format!("error: {msg}");
+                        t.status = format!("error: {message}");
                     }
                 }
             }
@@ -311,6 +363,13 @@ impl App {
         };
         p.terminal.cols = f.cols;
         p.terminal.rows = f.rows;
+        // A non-empty password field means "remember this password" — for
+        // both Save and Save & connect. Empty keeps whatever is stored.
+        if !f.password.is_empty() {
+            if let Err(e) = creds::set(&p.target(), &f.password) {
+                self.status = format!("cannot remember password: {e}");
+            }
+        }
         match self.form.edit_index {
             Some(i) => self.cfg.sessions[i] = p,
             None => self.cfg.sessions.push(p),
@@ -560,6 +619,11 @@ fn key_bytes(key: egui::Key, mods: egui::Modifiers, app_cursor: bool) -> Option<
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain_events();
+        let status = self
+            .active_tab
+            .and_then(|id| self.tabs.iter().find(|t| t.id == id))
+            .map(|t| t.status.clone())
+            .unwrap_or_else(|| self.status.clone());
 
         egui::TopBottomPanel::top("menu").show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -569,9 +633,12 @@ impl eframe::App for App {
                     self.form = Form::default();
                     self.show_form = true;
                 }
-                if ui.button("Disconnect").clicked() {
-                    if let Some(s) = &self.session {
-                        let _ = s.input.send(InputMsg::Eof);
+                if ui
+                    .add_enabled(self.active_tab.is_some(), egui::Button::new("Disconnect"))
+                    .clicked()
+                {
+                    if let Some(id) = self.active_tab {
+                        self.close_tab(id);
                     }
                 }
                 let mut dark = self.theme_dark;
@@ -586,10 +653,55 @@ impl eframe::App for App {
                     ctx.set_style(style);
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(&self.status);
+                    ui.label(&status);
                 });
             });
         });
+
+        // ---- tab strip: one tab per live session ----------------------------
+        if !self.tabs.is_empty() {
+            egui::TopBottomPanel::top("tabs")
+                .frame(egui::Frame::new().inner_margin(egui::Margin::symmetric(6, 2)))
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        let mut close_id = None;
+                        let mut select_id = None;
+                        for t in &self.tabs {
+                            let selected = self.active_tab == Some(t.id);
+                            // ● = shell is alive, ○ = closed/failed
+                            let dot = if t
+                                .session
+                                .as_ref()
+                                .is_some_and(|s| s.connected)
+                            {
+                                "●"
+                            } else {
+                                "○"
+                            };
+                            if ui
+                                .selectable_label(selected, format!("{dot} {}", t.title))
+                                .clicked()
+                            {
+                                select_id = Some(t.id);
+                            }
+                            if ui
+                                .small_button("✕")
+                                .on_hover_text("close this tab")
+                                .clicked()
+                            {
+                                close_id = Some(t.id);
+                            }
+                            ui.separator();
+                        }
+                        if let Some(id) = select_id {
+                            self.active_tab = Some(id);
+                        }
+                        if let Some(id) = close_id {
+                            self.close_tab(id);
+                        }
+                    });
+                });
+        }
 
         egui::SidePanel::left("sessions")
             .resizable(true)
@@ -664,13 +776,25 @@ impl eframe::App for App {
             });
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            if self.session.is_none() {
+            let Some(idx) = self
+                .active_tab
+                .and_then(|id| self.tabs.iter().position(|t| t.id == id))
+            else {
                 ui.centered_and_justified(|ui| {
                     ui.label("No session. Use “New session…” or pick a saved one.");
                 });
                 return;
+            };
+            let font_size = self.cfg.defaults.terminal.font_size;
+            let tab = &mut self.tabs[idx];
+            match &mut tab.session {
+                Some(sess) => draw_terminal(sess, font_size, ui),
+                None => {
+                    ui.centered_and_justified(|ui| {
+                        ui.label(&tab.status);
+                    });
+                }
             }
-            self.draw_terminal(ui);
         });
 
         if self.show_form {
@@ -792,19 +916,15 @@ impl eframe::App for App {
     }
 }
 
-impl App {
-    fn draw_terminal(&mut self, ui: &mut egui::Ui) {
-        let font_size = self.cfg.defaults.terminal.font_size;
-        let font = egui::FontId::monospace(font_size);
+/// Draw one session's terminal grid and route its input. A free function so
+/// the borrow of the tab does not go through `App`.
+fn draw_terminal(sess: &mut Session, font_size: f32, ui: &mut egui::Ui) {
+    let font = egui::FontId::monospace(font_size);
         let (cw, ch) = {
             let g = ui
                 .painter()
                 .layout_no_wrap("M".to_owned(), font.clone(), egui::Color32::WHITE);
             (g.size().x.max(1.0), g.size().y.max(1.0))
-        };
-
-        let Some(sess) = &mut self.session else {
-            return;
         };
         let (cols, rows) = sess.screen.size();
 
@@ -1022,7 +1142,6 @@ impl App {
         if resp.drag_stopped() {
             sess.drag_anchor = None;
         }
-    }
 }
 
 #[cfg(test)]
