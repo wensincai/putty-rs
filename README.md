@@ -10,7 +10,7 @@
 |---|---|---|
 | SSH-2 传输、密钥交换、加密 | ✅ 通过 `russh`（curve25519/aes-gcm/chacha20-poly1305…） | `ssh/transport2.c` `ssh/kex2-client.c` `ssh/bpp2.c` |
 | 主机密钥校验（known_hosts + TOFU）、SHA256/MD5 指纹 | ✅ 自研 `pt-core/known_hosts.rs` | `ssh/…` + `windows/…` host key 对话框 |
-| 认证：公钥 / 密码 / ssh-agent | ✅ | `ssh/userauth2-client.c` `ssh/agentf.c` |
+| 认证：公钥 / 密码 / ssh-agent / keyboard-interactive | ✅ | `ssh/userauth2-client.c` `ssh/agentf.c` |
 | 单命令执行（退出码透传，stdout/stderr 分离） | ✅ | `unix/plink.c` |
 | 交互式会话（PTY、窗口尺寸、raw 键盘） | ✅ | `ssh/sesschan.c` `unix/pty.c` |
 | 终端仿真（VT100/xterm 子集、256 色/真彩、备用屏、滚动区、宽字符） | ✅ 自研 `pt-term` | `terminal/terminal.c`（8,185 行） |
@@ -94,7 +94,7 @@ pt sftp rm   user@host:/tmp/releases -r
 pt-gui
 ```
 
-认证顺序默认 `publickey,agent,password,keyboard-interactive`，可用 `-o PreferredAuthentications=password` 调整；密码优先取 `$PT_PASSWORD`，否则交互提示（不回显）。
+认证顺序默认 `publickey,agent,password,keyboard-interactive`（keyboard-interactive 的密码型提示同样走密码回调），可用 `-o PreferredAuthentications=password` 调整；密码优先取 `$PT_PASSWORD`，否则交互提示（不回显）。
 
 配置与会话保存在 `%APPDATA%\pt-rs\sessions.json`（Windows）或 `~/.config/pt-rs/sessions.json`。密码不写入磁盘。
 
@@ -121,7 +121,7 @@ pt-gui
 | 无 Pageant 服务端 | 走 OpenSSH agent 协议 / Pageant 客户端 |
 | 终端不做 reflow | 改变窗口宽度时按行截断/补空，不做自动重排 |
 | 配置格式为 JSON | 不兼容 PuTTY 注册表/`~/.putty/sessions` |
-| keyboard-interactive 未实现 | 2FA/OTP 场景暂不可用 |
+| 键盘交互认证仅支持密码型提示 | keyboard-interactive 已实现（RFC 4256）：非回显提示统一用密码应答；多因素 OTP 的附加文本提示暂不能交互输入 |
 | 在 mintty / Git Bash 中运行 CLI 没有 PTY | 这类终端给子进程的是管道而非控制台，`pt` 检测到 stdin 非终端后不会申请 PTY（行为同 `ssh -T`）：Tab 补全失效、vim 无法切换模式。会打印警告；可改用 Windows Terminal / cmd / PowerShell，或加 `--force-pty` |
 
 ## 许可证

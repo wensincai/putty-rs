@@ -288,18 +288,73 @@ async fn authenticate(
                 }
             }
             AuthMethod::KeyboardInteractive => {
-                // russh requires a handler callback for each prompt; not wired yet.
-                report.record(
-                    AuthMethod::KeyboardInteractive,
-                    "not implemented in this build",
-                    false,
-                );
+                // Same password source as the password method: an explicit
+                // password, or the prompt callback (asked at most once across
+                // both methods). Each non-echoing prompt gets the password.
+                let pw = match (&opts.password, &opts.password_prompt) {
+                    (Some(p), _) => Some(p.clone()),
+                    (None, Some(prompt)) if !asked_password => {
+                        asked_password = true;
+                        prompt().map(|p| p.to_string())
+                    }
+                    _ => None,
+                };
+                let Some(pw) = pw else {
+                    report.record(AuthMethod::KeyboardInteractive, "no password supplied", false);
+                    continue;
+                };
+                match keyboard_interactive(handle, &user, &pw).await {
+                    Ok(true) => {
+                        report.record(AuthMethod::KeyboardInteractive, "accepted", true);
+                        return Ok(());
+                    }
+                    Ok(false) => {
+                        report.record(AuthMethod::KeyboardInteractive, "server refused", false)
+                    }
+                    Err(e) => report.record(AuthMethod::KeyboardInteractive, format!("{e}"), false),
+                }
             }
         }
     }
 
     Err(PtError::Auth(
         report.failure_message(&user, &profile.host),
+    ))
+}
+
+/// Keyboard-interactive (RFC 4256): start the exchange, then answer every
+/// round of prompts. Non-echoing prompts (i.e. password-style) receive the
+/// password; echoing prompts receive an empty answer, because we only have a
+/// secret to offer. Bounded rounds guard against a misbehaving server.
+async fn keyboard_interactive(
+    handle: &mut Handle<ClientHandler>,
+    user: &str,
+    password: &str,
+) -> Result<bool> {
+    use russh::client::KeyboardInteractiveAuthResponse as Resp;
+
+    let mut resp = handle
+        .authenticate_keyboard_interactive_start(user, None)
+        .await
+        .map_err(|e| PtError::Auth(format!("keyboard-interactive: {e}")))?;
+    for _ in 0..16 {
+        match resp {
+            Resp::Success => return Ok(true),
+            Resp::Failure { .. } => return Ok(false),
+            Resp::InfoRequest { prompts, .. } => {
+                let answers: Vec<String> = prompts
+                    .iter()
+                    .map(|p| if p.echo { String::new() } else { password.to_string() })
+                    .collect();
+                resp = handle
+                    .authenticate_keyboard_interactive_respond(answers)
+                    .await
+                    .map_err(|e| PtError::Auth(format!("keyboard-interactive: {e}")))?;
+            }
+        }
+    }
+    Err(PtError::Auth(
+        "keyboard-interactive: too many prompt rounds".into(),
     ))
 }
 
@@ -356,18 +411,31 @@ async fn agent_auth(
     user: &str,
 ) -> Result<Option<String>> {
     use russh::keys::agent::client::AgentClient;
-    // Prefer the OpenSSH for Windows agent pipe, then Pageant.
-    if let Ok(mut agent) =
-        AgentClient::connect_named_pipe(r"\\.\pipe\openssh-ssh-agent").await
-    {
-        return agent_identities!(handle, user, agent);
+    // Prefer the OpenSSH for Windows agent pipe, then Pageant. A reachable
+    // pipe that answers garbage (service half-dead, "early eof") must not
+    // stop us from trying Pageant — collect reasons and only fail at the end.
+    let mut why = Vec::new();
+    let pipe_result: Result<Option<String>> =
+        match AgentClient::connect_named_pipe(r"\\.\pipe\openssh-ssh-agent").await {
+            Ok(mut agent) => agent_identities!(handle, user, agent),
+            Err(e) => Err(PtError::Auth(format!("openssh-agent pipe: {e}"))),
+        };
+    match pipe_result {
+        Ok(Some(desc)) => return Ok(Some(desc)),
+        Ok(None) => why.push("openssh-agent pipe: no usable identity".into()),
+        Err(e) => why.push(format!("openssh-agent pipe: {e}")),
     }
-    match AgentClient::connect_pageant().await {
-        Ok(mut agent) => agent_identities!(handle, user, agent),
-        Err(e) => Err(PtError::Auth(format!(
-            "no ssh-agent found (OpenSSH pipe or Pageant): {e}"
-        ))),
+    let pageant_result: Result<Option<String>> =
+        match AgentClient::connect_pageant().await {
+            Ok(mut agent) => agent_identities!(handle, user, agent),
+            Err(e) => Err(PtError::Auth(format!("Pageant: {e}"))),
+        };
+    match pageant_result {
+        Ok(Some(desc)) => return Ok(Some(desc)),
+        Ok(None) => why.push("Pageant: no usable identity".into()),
+        Err(e) => why.push(format!("Pageant: {e}")),
     }
+    Err(PtError::Auth(why.join("; ")))
 }
 
 /// Convenience helper used by tests and the CLI banner.

@@ -87,6 +87,14 @@ struct App {
     show_form: bool,
     status: String,
     theme_dark: bool,
+    /// A saved session waiting for its password before connecting.
+    pw_dialog: Option<PwDialog>,
+}
+
+/// Password asked at connect time; never persisted to sessions.json.
+struct PwDialog {
+    profile: SessionProfile,
+    text: String,
 }
 
 impl App {
@@ -111,6 +119,27 @@ impl App {
             show_form: false,
             status: String::new(),
             theme_dark: true,
+            pw_dialog: None,
+        }
+    }
+
+    /// Connect straight away when a key is configured; otherwise ask for a
+    /// password first (the GUI cannot prompt mid-authentication like the CLI).
+    fn start_connect(&mut self, profile: SessionProfile, ctx: egui::Context) {
+        if profile.auth.key_path.is_some() {
+            self.connect(profile, None, ctx);
+        } else {
+            self.pw_dialog = Some(PwDialog { profile, text: String::new() });
+        }
+    }
+
+    /// Like [`App::start_connect`], but with a password typed into the session
+    /// form (used by "Save & connect"); empty means ask in the dialog.
+    fn start_connect_with(&mut self, profile: SessionProfile, pw: String, ctx: egui::Context) {
+        if pw.is_empty() {
+            self.start_connect(profile, ctx);
+        } else {
+            self.connect(profile, Some(pw), ctx);
         }
     }
 
@@ -471,9 +500,7 @@ impl eframe::App for App {
                 }
                 if let Some(i) = connect_idx {
                     let profile = self.cfg.sessions[i].clone();
-                    let pw = std::mem::take(&mut self.form.password);
-                    let pw = if pw.is_empty() { None } else { Some(pw) };
-                    self.connect(profile, pw, ctx.clone());
+                    self.start_connect(profile, ctx.clone());
                 }
                 if let Some(i) = edit_idx {
                     let s = &self.cfg.sessions[i];
@@ -571,8 +598,7 @@ impl eframe::App for App {
                             self.save_form();
                             if let Some(p) = self.cfg.sessions.last().cloned() {
                                 let pw = std::mem::take(&mut self.form.password);
-                                let pw = if pw.is_empty() { None } else { Some(pw) };
-                                self.connect(p, pw, ctx.clone());
+                                self.start_connect_with(p, pw, ctx.clone());
                             }
                         }
                         if ui.button("Cancel").clicked() {
@@ -581,6 +607,50 @@ impl eframe::App for App {
                     });
                 });
             self.show_form = open;
+        }
+
+        // Connect-time password dialog for saved sessions. The password stays
+        // in memory only — PuTTY does not persist it either.
+        if self.pw_dialog.is_some() {
+            let mut open = true;
+            let mut submit = false;
+            let mut cancel = false;
+            if let Some(d) = &mut self.pw_dialog {
+                egui::Window::new(format!("Password — {}", d.profile.target()))
+                    .open(&mut open)
+                    .default_width(380.0)
+                    .show(ctx, |ui| {
+                        ui.label("Password (leave empty if the server accepts your key):");
+                        let resp = ui.add(
+                            egui::TextEdit::singleline(&mut d.text).password(true),
+                        );
+                        if resp.lost_focus()
+                            && ui.input(|i| i.key_pressed(egui::Key::Enter))
+                        {
+                            submit = true;
+                        }
+                        ui.separator();
+                        ui.horizontal(|ui| {
+                            if ui.button("Connect").clicked() {
+                                submit = true;
+                            }
+                            if ui.button("Cancel").clicked() {
+                                cancel = true;
+                            }
+                        });
+                    });
+                if cancel {
+                    open = false;
+                }
+            }
+            match self.pw_dialog.take() {
+                Some(d) if submit => {
+                    let pw = if d.text.is_empty() { None } else { Some(d.text) };
+                    self.connect(d.profile, pw, ctx.clone());
+                }
+                Some(d) if open => self.pw_dialog = Some(d),
+                _ => {}
+            }
         }
     }
 }
