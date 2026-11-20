@@ -685,7 +685,11 @@ impl eframe::App for App {
                                 select_id = Some(t.id);
                             }
                             if ui
-                                .small_button("✕")
+                                .add(
+                                    egui::Button::new(egui::RichText::new("✕").weak())
+                                        .frame(false)
+                                        .small(),
+                                )
                                 .on_hover_text("close this tab")
                                 .clicked()
                             {
